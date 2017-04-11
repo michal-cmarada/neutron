@@ -15,7 +15,7 @@
 
 import abc
 import time
-
+import eventlet
 import netaddr
 from neutron_lib import constants
 from oslo_config import cfg
@@ -287,6 +287,80 @@ class NullDriver(LinuxInterfaceDriver):
 
     def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
         pass
+
+class NSDriver(LinuxInterfaceDriver):
+    """Device independent driver enabling creation of a non device specific
+    interface in network spaces.  Attachment to the device is not performed.
+    """
+    MAX_TIME_FOR_DEVICE_EXISTENCE = 30
+
+    @classmethod
+    def _device_is_created_in_time(cls, device_name):
+        """See if device is created, within time limit."""
+        attempt = 0
+        while attempt < NSDriver.MAX_TIME_FOR_DEVICE_EXISTENCE:
+            if ip_lib.device_exists(device_name):
+                return True
+            attempt += 1
+            eventlet.sleep(1)
+        LOG.error(_LE("Device %(dev)s was not created in %(time)d seconds"),
+                  {'dev': device_name,
+                   'time': NSDriver.MAX_TIME_FOR_DEVICE_EXISTENCE})
+        return False
+
+    def _configure_mtu(self, ns_dev, mtu=None):
+        # Need to set MTU, after added to namespace. See review
+        # https://review.openstack.org/327651
+        try:
+            # Note: network_device_mtu will be deprecated in future
+            mtu_override = self.conf.network_device_mtu
+        except cfg.NoSuchOptError:
+            LOG.warning(_LW("Config setting for MTU deprecated - any "
+                            "override will be ignored."))
+            mtu_override = None
+        if mtu_override:
+            mtu = mtu_override
+            LOG.debug("Overriding MTU to %d", mtu)
+        if mtu:
+            ns_dev.link.set_mtu(mtu)
+        else:
+            LOG.debug("No MTU provided - skipping setting value")
+
+    def plug(self, network_id, port_id, device_name, mac_address,
+             bridge=None, namespace=None, prefix=None, mtu=None):
+
+        # Overriding this, we still want to add an existing device into the
+        # namespace.
+        self.plug_new(network_id, port_id, device_name, mac_address,
+                      bridge, namespace, prefix, mtu)
+
+    def plug_new(self, network_id, port_id, device_name, mac_address,
+                 bridge=None, namespace=None, prefix=None, mtu=None):
+
+        ip = ip_lib.IPWrapper()
+        ns_dev = ip.device(device_name)
+
+        LOG.debug("Plugging dev: '%s' into namespace: '%s' ",
+                  device_name, namespace)
+
+        # Wait for device creation
+        if not self._device_is_created_in_time(device_name):
+            return
+
+        ns_dev.link.set_address(mac_address)
+
+        if namespace:
+            namespace_obj = ip.ensure_namespace(namespace)
+            namespace_obj.add_device_to_namespace(ns_dev)
+
+        self._configure_mtu(ns_dev, mtu)
+
+        ns_dev.link.set_up()
+
+    def unplug(self, device_name, bridge=None, namespace=None, prefix=None):
+        # Device removal is done externally. Just remove the namespace
+        LOG.debug("Removing namespace: '%s'", namespace)
+        ip_lib.IPWrapper(namespace).garbage_collect_namespace()
 
 
 class OVSInterfaceDriver(LinuxInterfaceDriver):
